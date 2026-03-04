@@ -4,12 +4,11 @@ import configparser
 import os
 import shutil
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
 from rclone_setup.config import APP_CACHE_DIR, APP_RCLONE_CONFIG, SyncPair
-
-BISYNC_TIMEOUT = 300
 
 
 def _base_args() -> list[str]:
@@ -240,7 +239,10 @@ def run_bisync(
     pair: SyncPair,
     resync: bool = False,
     extra_flags: list[str] | None = None,
+    log_callback: Callable[[str], None] | None = None,
 ) -> SyncResult:
+    """Run rclone bisync with no timeout, streaming output line-by-line via log_callback.
+    stderr is merged into stdout so all verbose output is captured together."""
     cmd = ["rclone", *_base_args(), "bisync", pair.path1, pair.path2, "--verbose"]
     if resync:
         cmd.append("--resync")
@@ -250,23 +252,27 @@ def run_bisync(
         cmd.extend(extra_flags)
 
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # merge stderr so verbose lines stream in order
             text=True,
-            timeout=BISYNC_TIMEOUT,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
         )
+        lines: list[str] = []
+        for raw in proc.stdout:  # type: ignore[union-attr]
+            line = raw.rstrip("\n")
+            lines.append(line)
+            if log_callback and line:
+                log_callback(line)
+        proc.wait()
+        output = "\n".join(lines)
         return SyncResult(
-            success=result.returncode == 0,
-            output=result.stdout,
-            error=result.stderr,
-            timestamp=datetime.now().isoformat(timespec="seconds"),
-        )
-    except subprocess.TimeoutExpired:
-        return SyncResult(
-            success=False,
-            output="",
-            error="Bisync timed out after 300s",
+            success=proc.returncode == 0,
+            output=output,
+            error="",
             timestamp=datetime.now().isoformat(timespec="seconds"),
         )
     except FileNotFoundError:

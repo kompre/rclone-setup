@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import queue
 import sys
@@ -43,7 +44,56 @@ BISYNC_FLAG_OPTIONS: list[tuple[str, str, str]] = [
     ("--no-cleanup", "No cleanup", "Keep working directory after successful sync"),
     ("--ignore-case", "Ignore case", "Case-insensitive filename comparison"),
     ("--fix-case", "Fix case", "Fix destination filename case to match source"),
+    ("--fast-list", "Fast list", "Single recursive listing (fewer round-trips, more RAM)"),
 ]
+
+# (flag, label, description, rclone_builtin_default)
+PERF_FLAG_OPTIONS: list[tuple[str, str, str, str]] = [
+    ("--transfers", "Transfers", "Parallel file transfers", "4"),
+    ("--checkers", "Checkers", "Parallel file comparison workers", "8"),
+    ("--buffer-size", "Buffer size", "Read buffer per transfer (e.g. 32M, 128M)", "16M"),
+    ("--multi-thread-streams", "Multi-thread streams", "Parallel streams for large files", "4"),
+]
+
+
+def _machine_specs() -> tuple[int, int]:
+    """Returns (logical_cpu_count, total_ram_gb)."""
+    cpus = os.cpu_count() or 4
+    try:
+        class _MEMSTATUS(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+        m = _MEMSTATUS()
+        m.dwLength = ctypes.sizeof(_MEMSTATUS)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))  # type: ignore[attr-defined]
+        ram_gb = int(m.ullTotalPhys / 1024 ** 3)
+    except Exception:
+        ram_gb = 8
+    return cpus, ram_gb
+
+
+def _suggest_perf_flags(cpus: int, ram_gb: int) -> dict[str, str]:
+    """Compute suggested performance flag values based on machine specs."""
+    return {
+        "--transfers": str(min(max(4, cpus), 16)),
+        "--checkers": str(min(max(8, cpus * 2), 32)),
+        "--buffer-size": (
+            "128M" if ram_gb >= 32 else
+            "64M"  if ram_gb >= 16 else
+            "32M"  if ram_gb >= 8  else
+            "16M"
+        ),
+        "--multi-thread-streams": str(min(max(4, cpus // 2), 8)),
+    }
 
 _STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _STARTUP_APP_NAME = "rclone-bisync-manager"
@@ -464,13 +514,17 @@ class App(ctk.CTk):
                     continue
 
                 log_q.put(f"  [{pair.path1}] Running bisync...")
-                result = run_bisync(pair, extra_flags=self.config_data.bisync_flags or None)
+                result = run_bisync(
+                    pair,
+                    extra_flags=self.config_data.bisync_flags or None,
+                    log_callback=lambda line: log_q.put(f"    {line}"),
+                )
                 if result.success:
                     log_q.put(f"  [{pair.path1}] OK")
                 else:
-                    err = result.error.splitlines()[0] if result.error else "unknown"
+                    err = result.output.splitlines()[-1] if result.output else "unknown"
                     log_q.put(f"  [{pair.path1}] Error: {err}")
-                    if "resync" in result.error.lower():
+                    if "resync" in result.output.lower():
                         pair.initialized = False
                         any_changed = True
                         log_q.put(f"  [{pair.path1}] Marked as needs resync")
@@ -478,8 +532,6 @@ class App(ctk.CTk):
                 log_lines.append(f"=== {pair.path1} <-> {pair.path2} ({result.timestamp}) ===")
                 if result.output:
                     log_lines.append(result.output)
-                if result.error:
-                    log_lines.append(result.error)
 
             if any_changed:
                 save_config(self.config_data)
@@ -549,16 +601,16 @@ class App(ctk.CTk):
             flags = self.config_data.bisync_flags + ["--dry-run"]
             for pair in pairs:
                 log_q.put(f"  [{pair.path1}] Dry run...")
-                result = run_bisync(pair, extra_flags=flags)
+                result = run_bisync(
+                    pair,
+                    extra_flags=flags,
+                    log_callback=lambda line: log_q.put(f"    {line}"),
+                )
                 if result.success:
                     log_q.put(f"  [{pair.path1}] Dry run OK")
                 else:
-                    err = result.error.splitlines()[0] if result.error else "unknown"
+                    err = result.output.splitlines()[-1] if result.output else "unknown"
                     log_q.put(f"  [{pair.path1}] Dry run error: {err}")
-                if result.output:
-                    log_q.put(result.output.rstrip())
-                if result.error and not result.success:
-                    log_q.put(result.error.rstrip())
             log_q.put("--- Dry run finished ---")
             log_q.put(None)
 
@@ -678,17 +730,17 @@ class App(ctk.CTk):
                 log_q.put(None)
                 return
 
-            result = run_bisync(pair, resync=True)
+            result = run_bisync(
+                pair,
+                resync=True,
+                log_callback=lambda line: log_q.put(f"    {line}"),
+            )
             success_holder[0] = result.success
             if result.success:
                 log_q.put(f"Resync OK for [{pair.path1}]")
             else:
-                err = result.error.splitlines()[0] if result.error else "unknown"
+                err = result.output.splitlines()[-1] if result.output else "unknown"
                 log_q.put(f"Resync failed: {err}")
-            if result.output:
-                log_q.put(result.output.rstrip())
-            if result.error and not result.success:
-                log_q.put(result.error.rstrip())
             log_q.put(None)
 
         def drain() -> None:
@@ -1009,50 +1061,99 @@ class EditPathDialog(ctk.CTkToplevel):
 
 
 class PreferencesDialog(ctk.CTkToplevel):
-    def __init__(self, parent: ctk.CTk, config: "AppConfig") -> None:
+    _VALUED_KEYS = {f for f, _, _, _ in PERF_FLAG_OPTIONS}
+
+    def __init__(self, parent: ctk.CTk, config: AppConfig) -> None:
         super().__init__(parent)
         self.title("Preferences")
-        self.geometry("480x420")
+        self.geometry("560x660")
         self.resizable(False, False)
         self.grab_set()
         self._config = config
 
         self.grid_columnconfigure(0, weight=1)
 
-        # --- Launch at startup ---
+        # Parse stored flags into booleans and valued pairs
+        bool_flags, valued_flags = self._parse_flags(config.bisync_flags)
+
+        # Detect machine specs and compute suggestions
+        cpus, ram_gb = _machine_specs()
+        self._suggested = _suggest_perf_flags(cpus, ram_gb)
+
+        # --- System ---
         startup_frame = ctk.CTkFrame(self)
-        startup_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        startup_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 6))
         ctk.CTkLabel(
             startup_frame, text="System", font=ctk.CTkFont(size=12, weight="bold"),
         ).pack(anchor="w", padx=10, pady=(8, 4))
         self._startup_var = tk.BooleanVar(value=is_startup_enabled())
         ctk.CTkCheckBox(
-            startup_frame,
-            text="Launch at Windows startup",
-            variable=self._startup_var,
-            onvalue=True, offvalue=False,
+            startup_frame, text="Launch at Windows startup",
+            variable=self._startup_var, onvalue=True, offvalue=False,
         ).pack(anchor="w", padx=14, pady=(0, 10))
 
         # --- Bisync flags ---
         flags_frame = ctk.CTkFrame(self)
-        flags_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=8)
-        self.grid_rowconfigure(1, weight=1)
+        flags_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=6)
         ctk.CTkLabel(
-            flags_frame, text="Extra bisync flags", font=ctk.CTkFont(size=12, weight="bold"),
+            flags_frame, text="Bisync flags", font=ctk.CTkFont(size=12, weight="bold"),
         ).pack(anchor="w", padx=10, pady=(8, 4))
-
         self._flag_vars: dict[str, tk.BooleanVar] = {}
         for flag, label, desc in BISYNC_FLAG_OPTIONS:
-            var = tk.BooleanVar(value=flag in config.bisync_flags)
+            var = tk.BooleanVar(value=flag in bool_flags)
             self._flag_vars[flag] = var
             row = ctk.CTkFrame(flags_frame, fg_color="transparent")
             row.pack(fill="x", padx=10, pady=2)
-            ctk.CTkCheckBox(row, text=label, variable=var, onvalue=True, offvalue=False, width=160).pack(side="left")
-            ctk.CTkLabel(row, text=desc, text_color="gray60", font=ctk.CTkFont(size=11)).pack(side="left", padx=(8, 0))
+            ctk.CTkCheckBox(
+                row, text=label, variable=var, onvalue=True, offvalue=False, width=150,
+            ).pack(side="left")
+            ctk.CTkLabel(
+                row, text=desc, text_color="gray60", font=ctk.CTkFont(size=11),
+            ).pack(side="left", padx=(8, 0))
+
+        # --- Performance ---
+        perf_frame = ctk.CTkFrame(self)
+        perf_frame.grid(row=2, column=0, sticky="ew", padx=16, pady=6)
+
+        hdr = ctk.CTkFrame(perf_frame, fg_color="transparent")
+        hdr.pack(fill="x", padx=10, pady=(8, 4))
+        ctk.CTkLabel(
+            hdr, text="Performance", font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(side="left")
+        ctk.CTkLabel(
+            hdr, text=f"  —  {cpus} cores · {ram_gb} GB RAM",
+            text_color="gray60", font=ctk.CTkFont(size=11),
+        ).pack(side="left")
+        ctk.CTkButton(
+            hdr, text="Use suggested", width=110,
+            fg_color="#555", hover_color="#444", command=self._apply_suggested,
+        ).pack(side="right")
+
+        self._perf_entries: dict[str, ctk.CTkEntry] = {}
+        for flag, label, desc, builtin_default in PERF_FLAG_OPTIONS:
+            row = ctk.CTkFrame(perf_frame, fg_color="transparent")
+            row.pack(fill="x", padx=10, pady=3)
+            ctk.CTkLabel(row, text=label, width=155, anchor="w").pack(side="left")
+            entry = ctk.CTkEntry(row, width=72)
+            # Pre-fill: existing stored value → suggested → blank (use rclone default)
+            entry.insert(0, valued_flags.get(flag, self._suggested[flag]))
+            entry.pack(side="left", padx=(0, 8))
+            ctk.CTkLabel(
+                row,
+                text=f"{desc}  (rclone default: {builtin_default})",
+                text_color="gray60", font=ctk.CTkFont(size=11),
+            ).pack(side="left")
+            self._perf_entries[flag] = entry
+
+        ctk.CTkLabel(
+            perf_frame,
+            text="Clear a field to let rclone use its built-in default.",
+            text_color="gray50", font=ctk.CTkFont(size=10),
+        ).pack(anchor="w", padx=10, pady=(2, 10))
 
         # --- Buttons ---
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.grid(row=2, column=0, pady=14)
+        btn_frame.grid(row=3, column=0, pady=14)
         ctk.CTkButton(btn_frame, text="OK", width=90, command=self._ok).pack(side="left", padx=8)
         ctk.CTkButton(
             btn_frame, text="Cancel", width=90,
@@ -1061,15 +1162,42 @@ class PreferencesDialog(ctk.CTkToplevel):
 
         self.wait_window()
 
+    @staticmethod
+    def _parse_flags(flags: list[str]) -> tuple[set[str], dict[str, str]]:
+        """Split a flat flags list into (bool_flags, {flag: value})."""
+        bool_flags: set[str] = set()
+        valued_flags: dict[str, str] = {}
+        i = 0
+        while i < len(flags):
+            f = flags[i]
+            if f in PreferencesDialog._VALUED_KEYS and i + 1 < len(flags):
+                valued_flags[f] = flags[i + 1]
+                i += 2
+            else:
+                bool_flags.add(f)
+                i += 1
+        return bool_flags, valued_flags
+
+    def _apply_suggested(self) -> None:
+        for flag, entry in self._perf_entries.items():
+            entry.delete(0, "end")
+            entry.insert(0, self._suggested[flag])
+
     def _ok(self) -> None:
-        # Apply startup setting
         try:
             set_startup(self._startup_var.get())
         except OSError as e:
             messagebox.showerror("Startup Error", str(e), parent=self)
             return
-        # Apply flags
-        self._config.bisync_flags = [f for f, v in self._flag_vars.items() if v.get()]
+        flags: list[str] = []
+        for flag, var in self._flag_vars.items():
+            if var.get():
+                flags.append(flag)
+        for flag, entry in self._perf_entries.items():
+            val = entry.get().strip()
+            if val:
+                flags.extend([flag, val])
+        self._config.bisync_flags = flags
         self.destroy()
 
 
