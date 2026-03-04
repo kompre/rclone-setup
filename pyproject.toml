@@ -4,7 +4,11 @@ version = "0.1.0"
 description = "Desktop UI to manage rclone bisync jobs"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = ["FreeSimpleGUI"]
+dependencies = [
+    "customtkinter>=5.2.2",
+    "pillow>=11.0.0",
+    "pystray>=0.19.5",
+]
 
 [project.scripts]
 rclone-setup = "rclone_setup.app:main"
